@@ -1,35 +1,26 @@
 name: OCI A1 Retry
-
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
   schedule:
-    - cron: "*/10 * * * *"
-
+    - cron: "0 0 * * 0"  # 혹시 모르니 일요일마다 한번 살려두는 용
 concurrency:
   group: oci-a1-retry
   cancel-in-progress: false
-
 jobs:
   try-create-a1:
     runs-on: ubuntu-latest
     timeout-minutes: 9
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install OCI CLI
         run: |
           python -m pip install --upgrade pip
           pip install oci-cli
-
       - name: Write OCI config and key
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
@@ -41,7 +32,6 @@ jobs:
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-
           cat > ~/.oci/config <<EOF
           [DEFAULT]
           user=${OCI_USER_OCID}
@@ -51,7 +41,6 @@ jobs:
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
           chmod 600 ~/.oci/config
-
       - name: Retry loop
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
@@ -62,16 +51,12 @@ jobs:
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
-
-          end_time=$(( $(date +%s) + 8*60 ))
-
+          end_time=$(( $(date +%s) + 7*60 ))
           while [ "$(date +%s)" -lt "$end_time" ]; do
             echo "$(date -u) - Checking A1 capacity..."
-
             cat > cap.json <<EOF
-          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":4,"memoryInGBs":24}}]
+          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":1,"memoryInGBs":6}}]
           EOF
-
             CAPACITY_OUTPUT="$(oci compute compute-capacity-report create \
               --availability-domain "$OCI_AD_NAME" \
               --compartment-id "$OCI_TENANCY_OCID" \
@@ -79,20 +64,16 @@ jobs:
               --connection-timeout 60 \
               --read-timeout 120 \
               --output json)"
-
             STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c 'import sys,json; obj=json.load(sys.stdin); items=obj.get("data",{}).get("shape-availabilities",[]); print((items[0].get("availability-status") if items else "UNKNOWN") or "UNKNOWN")')"
-
             echo "Status: $STATUS"
-
             if [ "$STATUS" != "OUT_OF_HOST_CAPACITY" ]; then
               echo "Capacity available! Launching..."
-
               INSTANCE_OCID="$(oci compute instance launch \
                 --availability-domain "$OCI_AD_NAME" \
                 --compartment-id "$OCI_COMPARTMENT_OCID" \
                 --display-name "dividend-app-vm" \
                 --shape "VM.Standard.A1.Flex" \
-                --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
                 --subnet-id "$OCI_SUBNET_OCID" \
                 --assign-public-ip true \
                 --image-id "$OCI_IMAGE_OCID" \
@@ -101,13 +82,17 @@ jobs:
                 --read-timeout 600 \
                 --query 'data.id' \
                 --raw-output)"
-
               echo "INSTANCE_OCID=$INSTANCE_OCID"
               exit 0
             fi
-
             echo "No capacity. Waiting 60s..."
             sleep 60
           done
-
-          echo "8분 동안 자리 못 찾음. 다음 scheduled run에서 다시 시도."
+          echo "7분 동안 자리 못 찾음. 다음 실행에서 다시 시도."
+      - name: Re-trigger workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 60
+          gh workflow run oci-a1-retry.yml --ref main
