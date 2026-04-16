@@ -52,6 +52,7 @@ jobs:
           OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
           OCI_AD_NAME: ${{ secrets.OCI_AD_NAME }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
 
@@ -99,7 +100,7 @@ jobs:
             --subnet-id "$OCI_SUBNET_OCID" \
             --assign-public-ip true \
             --image-id "$OCI_IMAGE_OCID" \
-            --metadata "{\"ssh_authorized_keys\":\"dummy\"}" \
+            --metadata "{\"ssh_authorized_keys\":\"$OCI_SSH_PUBLIC_KEY\"}" \
             --connection-timeout 60 \
             --read-timeout 600 \
             --query 'data.id' \
