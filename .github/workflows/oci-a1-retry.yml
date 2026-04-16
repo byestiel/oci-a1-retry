@@ -55,7 +55,7 @@ jobs:
           while [ "$(date +%s)" -lt "$end_time" ]; do
             echo "$(date -u) - Checking A1 capacity..."
             cat > cap.json <<EOF
-          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":1,"memoryInGBs":6}}]
+          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":4,"memoryInGBs":24}}]
           EOF
             CAPACITY_OUTPUT="$(oci compute compute-capacity-report create \
               --availability-domain "$OCI_AD_NAME" \
@@ -73,7 +73,7 @@ jobs:
                 --compartment-id "$OCI_COMPARTMENT_OCID" \
                 --display-name "dividend-app-vm" \
                 --shape "VM.Standard.A1.Flex" \
-                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --shape-config '{"ocpus":4,"memoryInGBs":24}' \
                 --subnet-id "$OCI_SUBNET_OCID" \
                 --assign-public-ip true \
                 --image-id "$OCI_IMAGE_OCID" \
