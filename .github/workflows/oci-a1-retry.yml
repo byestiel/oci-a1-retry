@@ -1,18 +1,18 @@
-# 아무 의미없는 주석 한 줄 추가해서 push
-# triggered: 2025-04-16
 name: OCI A1 Retry
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
+
+concurrency:
+  group: oci-a1-retry
+  cancel-in-progress: false
 
 jobs:
   try-create-a1:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 9
 
     steps:
       - name: Checkout
@@ -48,8 +48,9 @@ jobs:
           region=${OCI_REGION}
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
+          chmod 600 ~/.oci/config
 
-      - name: Check capacity and launch once
+      - name: Retry loop
         env:
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
@@ -60,54 +61,51 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking A1 capacity..."
+          end_time=$(( $(date +%s) + 8*60 ))
 
-          cat > cap.json <<EOF
-          [
-            {
-              "instanceShape": "VM.Standard.A1.Flex",
-              "instanceShapeConfig": {
-                "ocpus": 1,
-                "memoryInGBs": 6
-              }
-            }
-          ]
+          while [ "$(date +%s)" -lt "$end_time" ]; do
+            echo "$(date -u) - Checking A1 capacity..."
+
+            cat > cap.json <<EOF
+          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":4,"memoryInGBs":24}}]
           EOF
 
-          CAPACITY_OUTPUT="$(oci compute compute-capacity-report create \
-            --availability-domain "$OCI_AD_NAME" \
-            --compartment-id "$OCI_TENANCY_OCID" \
-            --shape-availabilities file://cap.json \
-            --connection-timeout 60 \
-            --read-timeout 120 \
-            --output json)"
+            CAPACITY_OUTPUT="$(oci compute compute-capacity-report create \
+              --availability-domain "$OCI_AD_NAME" \
+              --compartment-id "$OCI_TENANCY_OCID" \
+              --shape-availabilities file://cap.json \
+              --connection-timeout 60 \
+              --read-timeout 120 \
+              --output json)"
 
-          echo "$CAPACITY_OUTPUT"
+            STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c 'import sys,json; obj=json.load(sys.stdin); items=obj.get("data",{}).get("shape-availabilities",[]); print((items[0].get("availability-status") if items else "UNKNOWN") or "UNKNOWN")')"
 
-          STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c 'import sys,json; obj=json.load(sys.stdin); items=obj.get("data",{}).get("shape-availabilities",[]); print((items[0].get("availability-status") if items else "UNKNOWN") or "UNKNOWN")')"
+            echo "Status: $STATUS"
 
-          echo "availability-status=$STATUS"
+            if [ "$STATUS" != "OUT_OF_HOST_CAPACITY" ]; then
+              echo "Capacity available! Launching..."
 
-          if [ "$STATUS" = "OUT_OF_HOST_CAPACITY" ]; then
-            echo "No A1 capacity right now. Exit successfully and wait for next schedule."
-            exit 0
-          fi
+              INSTANCE_OCID="$(oci compute instance launch \
+                --availability-domain "$OCI_AD_NAME" \
+                --compartment-id "$OCI_COMPARTMENT_OCID" \
+                --display-name "dividend-app-vm" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+                --subnet-id "$OCI_SUBNET_OCID" \
+                --assign-public-ip true \
+                --image-id "$OCI_IMAGE_OCID" \
+                --metadata "{\"ssh_authorized_keys\":\"$OCI_SSH_PUBLIC_KEY\"}" \
+                --connection-timeout 60 \
+                --read-timeout 600 \
+                --query 'data.id' \
+                --raw-output)"
 
-          echo "Capacity seems available. Launching instance..."
+              echo "INSTANCE_OCID=$INSTANCE_OCID"
+              exit 0
+            fi
 
-          INSTANCE_OCID="$(oci compute instance launch \
-            --availability-domain "$OCI_AD_NAME" \
-            --compartment-id "$OCI_COMPARTMENT_OCID" \
-            --display-name "dividend-app-vm" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
-            --subnet-id "$OCI_SUBNET_OCID" \
-            --assign-public-ip true \
-            --image-id "$OCI_IMAGE_OCID" \
-            --metadata "{\"ssh_authorized_keys\":\"$OCI_SSH_PUBLIC_KEY\"}" \
-            --connection-timeout 60 \
-            --read-timeout 600 \
-            --query 'data.id' \
-            --raw-output)"
+            echo "No capacity. Waiting 60s..."
+            sleep 60
+          done
 
-          echo "INSTANCE_OCID=$INSTANCE_OCID"
+          echo "8분 동안 자리 못 찾음. 다음 scheduled run에서 다시 시도."
