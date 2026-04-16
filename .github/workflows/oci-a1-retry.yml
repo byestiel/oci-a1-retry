@@ -92,7 +92,8 @@ jobs:
       - name: Re-trigger workflow
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           sleep 60
           gh workflow run oci-a1-retry.yml --ref main
+      
