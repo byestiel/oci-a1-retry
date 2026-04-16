@@ -2,6 +2,8 @@ name: OCI A1 Retry
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   schedule:
     - cron: "*/10 * * * *"
 
