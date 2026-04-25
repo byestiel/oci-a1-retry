@@ -13,6 +13,8 @@ jobs:
   try-create-a1:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      SUPPRESS_LABEL_WARNING: "True"
 
     steps:
       - name: Checkout
@@ -69,12 +71,22 @@ jobs:
 
           echo "Checking existing A1 instance..."
 
-          EXISTING_OCID="$(oci compute instance list \
+          INSTANCE_LIST_JSON="$(oci compute instance list \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
             --all \
-            --output json | python3 -c '
+            --output json)"
+
+          EXISTING_OCID="$(printf '%s' "$INSTANCE_LIST_JSON" | python3 -c '
           import sys, json
-          data = json.load(sys.stdin).get("data", [])
+
+          raw = sys.stdin.read().strip()
+          if not raw:
+              print("")
+              sys.exit(0)
+
+          obj = json.loads(raw)
+          data = obj.get("data", [])
+
           for x in data:
               if (
                   x.get("display-name") == "dividend-app-a1-vm"
@@ -108,7 +120,22 @@ jobs:
               --read-timeout 120 \
               --output json)"
 
-            STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c 'import sys,json; obj=json.load(sys.stdin); items=obj.get("data",{}).get("shape-availabilities",[]); print((items[0].get("availability-status") if items else "UNKNOWN") or "UNKNOWN")')"
+            STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c '
+          import sys, json
+
+          raw = sys.stdin.read().strip()
+          if not raw:
+              print("UNKNOWN")
+              sys.exit(0)
+
+          obj = json.loads(raw)
+          items = obj.get("data", {}).get("shape-availabilities", [])
+
+          if items:
+              print(items[0].get("availability-status") or "UNKNOWN")
+          else:
+              print("UNKNOWN")
+          ')"
 
             echo "Status: $STATUS"
 
