@@ -63,6 +63,7 @@ jobs:
               return None
           
           def main():
+              record('진단 버전', 'INFO', '2 - 사용자가 복사한 실제 서브넷과 비교')
               keys = ('USER_OCID', 'TENANCY_OCID', 'FINGERPRINT', 'REGION',
                       'PRIVATE_KEY', 'COMPARTMENT_OCID', 'SUBNET_OCID', 'IMAGE_OCID', 'AD_NAME')
               missing = ['OCI_' + k for k in keys if not os.getenv('OCI_' + k, '').strip()]
@@ -70,6 +71,10 @@ jobs:
                   record('Secrets', 'CHECK', '누락: ' + ', '.join(missing))
                   return
               e = {k: os.environ['OCI_' + k].strip() for k in keys}
+              expected_subnet = 'ocid1.subnet.oc1.ap-chuncheon-1.aaaaaaaafv6qycjmsrotm6a32trsmmmplnr3577zbsgrx4ua3gtanknqzcvq'
+              same_subnet = e['SUBNET_OCID'] == expected_subnet
+              check('저장된 서브넷 OCID 일치', same_subnet,
+                    '일치' if same_subnet else '불일치: GitHub OCI_SUBNET_OCID를 사용자가 Copy한 값으로 저장하세요')
               check('춘천 리전 설정', e['REGION'] == 'ap-chuncheon-1',
                     '기존 Micro 서버가 있는 춘천 리전과 일치하는지 확인')
               check('기존 서버 AD와 일치', e['AD_NAME'] == 'uTzO:AP-CHUNCHEON-1-AD-1',
@@ -88,6 +93,10 @@ jobs:
                         '설정한 AD가 이 계정/리전의 조회 결과에 포함되는지 확인')
           
               subnet = query('서브넷 조회', lambda: network.get_subnet(e['SUBNET_OCID']))
+              if not same_subnet:
+                  confirmed_subnet = query('복사한 실제 서브넷 직접 조회', lambda: network.get_subnet(expected_subnet))
+                  if confirmed_subnet is not None:
+                      record('서브넷 비교 결과', 'INFO', '실제 서브넷 접근 성공. 저장된 OCI_SUBNET_OCID가 다른 것이 확인됐습니다.')
               if subnet is not None:
                   check('서브넷 상태', subnet.lifecycle_state == 'AVAILABLE', subnet.lifecycle_state)
                   check('공인 IP 허용', subnet.prohibit_public_ip_on_vnic is False,
