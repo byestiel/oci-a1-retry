@@ -3,7 +3,11 @@ name: OCI A1 Retry
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * 0"  # 혹시 모르니 일요일마다 한번 살려두는 용
+    # 앞 실행이 실패해도 5분마다 독립적으로 실행합니다. (UTC)
+    - cron: "2-57/5 * * * *"
+
+permissions:
+  contents: read
 
 concurrency:
   group: oci-a1-retry
@@ -12,166 +16,137 @@ concurrency:
 jobs:
   try-create-a1:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      SUPPRESS_LABEL_WARNING: "True"
+    timeout-minutes: 6
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install OCI CLI
-        run: |
-          python -m pip install --upgrade pip
-          pip install oci-cli
+      - name: Install OCI SDK
+        run: python -m pip install --disable-pip-version-check "oci==2.185.1"
 
-      - name: Write OCI config and key
+      - name: Check existing instance and try once
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p ~/.oci
-          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${OCI_USER_OCID}
-          fingerprint=${OCI_FINGERPRINT}
-          tenancy=${OCI_TENANCY_OCID}
-          region=${OCI_REGION}
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
-
-          chmod 600 ~/.oci/config
-
-      - name: Retry loop
-        id: retry
-        env:
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
           OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
           OCI_AD_NAME: ${{ secrets.OCI_AD_NAME }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
         run: |
-          set -euo pipefail
+          python -u - <<'PY'
+          import os
+          import sys
+          import uuid
+          import oci
 
-          TARGET_DISPLAY_NAME="dividend-app-a1-vm"
-          echo "created=false" >> "$GITHUB_OUTPUT"
+          TARGET = "dividend-app-a1-vm"
+          SHAPE = "VM.Standard.A1.Flex"
 
-          echo "Checking existing A1 instance..."
+          def main():
+              required = (
+                  "OCI_USER_OCID", "OCI_TENANCY_OCID",
+                  "OCI_FINGERPRINT", "OCI_REGION", "OCI_PRIVATE_KEY",
+                  "OCI_COMPARTMENT_OCID", "OCI_SUBNET_OCID",
+                  "OCI_IMAGE_OCID", "OCI_AD_NAME", "OCI_SSH_PUBLIC_KEY",
+              )
+              missing = [k for k in required if not os.getenv(k, "").strip()]
+              if missing:
+                  print("누락된 GitHub Secrets: " + ", ".join(missing))
+                  return 1
 
-          INSTANCE_LIST_JSON="$(oci compute instance list \
-            --compartment-id "$OCI_COMPARTMENT_OCID" \
-            --all \
-            --output json)"
+              config = {
+                  "user": os.environ["OCI_USER_OCID"].strip(),
+                  "tenancy": os.environ["OCI_TENANCY_OCID"].strip(),
+                  "fingerprint": os.environ["OCI_FINGERPRINT"].strip(),
+                  "region": os.environ["OCI_REGION"].strip(),
+                  "key_content": os.environ["OCI_PRIVATE_KEY"].strip(),
+              }
+              compartment = os.environ["OCI_COMPARTMENT_OCID"].strip()
+              no_retry = oci.retry.NoneRetryStrategy()
+              compute = oci.core.ComputeClient(
+                  config, timeout=(15, 60), retry_strategy=no_retry,
+              )
 
-          EXISTING_OCID="$(printf '%s' "$INSTANCE_LIST_JSON" | python3 -c '
-          import sys, json
+              # 조회 실패 시 생성하지 않습니다. 다음 예약 실행에서 재확인합니다.
+              print("기존 인스턴스 확인 중...")
+              instances = oci.pagination.list_call_get_all_results(
+                  compute.list_instances,
+                  compartment_id=compartment,
+                  retry_strategy=no_retry,
+              ).data
+              active = [
+                  x for x in instances if x.lifecycle_state != "TERMINATED"
+              ]
+              targets = [x for x in active if x.display_name == TARGET]
+              if targets:
+                  for x in targets:
+                      print(f"기존 인스턴스: {x.display_name} / {x.shape}")
+                      print(f"상태: {x.lifecycle_state} / ID: {x.id}")
+                  print("추가 생성하지 않습니다. RUNNING이면 확보 완료입니다.")
+                  return 0
 
-          raw = sys.stdin.read().strip()
-          if not raw:
-              print("")
-              sys.exit(0)
+              # 같은 구획에 다른 A1이 있으면 무료 한도 초과를 피합니다.
+              # 다른 구획/리전의 자원과 전체 디스크 사용량은 별도 확인하세요.
+              if any(x.shape == SHAPE for x in active):
+                  print("이 구획에 다른 A1이 있습니다. 사용량 확인 후 진행하세요.")
+                  return 1
 
-          obj = json.loads(raw)
-          data = obj.get("data", [])
+              image_id = os.environ["OCI_IMAGE_OCID"].strip()
+              print("이미지의 A1 호환성 확인 중...")
+              compute.get_image_shape_compatibility_entry(
+                  image_id=image_id, shape_name=SHAPE,
+                  retry_strategy=no_retry,
+              )
 
-          for x in data:
-              if (
-                  x.get("display-name") == "dividend-app-a1-vm"
-                  and x.get("shape") == "VM.Standard.A1.Flex"
-                  and x.get("lifecycle-state") not in ("TERMINATED", "TERMINATING")
-              ):
-                  print(x.get("id", ""))
-                  break
-          ')"
+              details = oci.core.models.LaunchInstanceDetails(
+                  availability_domain=os.environ["OCI_AD_NAME"].strip(),
+                  compartment_id=compartment,
+                  display_name=TARGET,
+                  shape=SHAPE,
+                  shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                      ocpus=2, memory_in_gbs=12,
+                  ),
+                  create_vnic_details=oci.core.models.CreateVnicDetails(
+                      subnet_id=os.environ["OCI_SUBNET_OCID"].strip(),
+                      assign_public_ip=True,
+                  ),
+                  source_details=oci.core.models.InstanceSourceViaImageDetails(
+                      image_id=image_id, boot_volume_size_in_gbs=50,
+                  ),
+                  metadata={
+                      "ssh_authorized_keys": os.environ["OCI_SSH_PUBLIC_KEY"].strip(),
+                  },
+              )
+              print("A1 2 OCPU / 12GB / 부팅 디스크 50GB 생성 요청 중...")
+              instance = compute.launch_instance(
+                  details, opc_retry_token=str(uuid.uuid4()),
+                  retry_strategy=no_retry,
+              ).data
+              print(f"생성 요청 접수: {instance.id}")
+              print(f"현재 상태: {instance.lifecycle_state}")
+              print("아직 RUNNING이 아닐 수 있습니다. 다음 실행에서 확인합니다.")
+              return 0
 
-          if [ -n "$EXISTING_OCID" ]; then
-            echo "A1 instance already exists: $EXISTING_OCID"
-            echo "created=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          end_time=$(( $(date +%s) + 7*60 ))
-
-          while [ "$(date +%s)" -lt "$end_time" ]; do
-            echo "$(date -u) - Checking A1 capacity..."
-
-            cat > cap.json <<EOF
-          [{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":4,"memoryInGBs":24}}]
-          EOF
-
-            CAPACITY_OUTPUT="$(oci compute compute-capacity-report create \
-              --availability-domain "$OCI_AD_NAME" \
-              --compartment-id "$OCI_COMPARTMENT_OCID" \
-              --shape-availabilities file://cap.json \
-              --connection-timeout 60 \
-              --read-timeout 120 \
-              --output json)"
-
-            STATUS="$(printf '%s' "$CAPACITY_OUTPUT" | python3 -c '
-          import sys, json
-
-          raw = sys.stdin.read().strip()
-          if not raw:
-              print("UNKNOWN")
-              sys.exit(0)
-
-          obj = json.loads(raw)
-          items = obj.get("data", {}).get("shape-availabilities", [])
-
-          if items:
-              print(items[0].get("availability-status") or "UNKNOWN")
-          else:
-              print("UNKNOWN")
-          ')"
-
-            echo "Status: $STATUS"
-
-            if [ "$STATUS" = "AVAILABLE" ]; then
-              echo "Capacity available! Launching..."
-
-              INSTANCE_OCID="$(oci compute instance launch \
-                --availability-domain "$OCI_AD_NAME" \
-                --compartment-id "$OCI_COMPARTMENT_OCID" \
-                --display-name "$TARGET_DISPLAY_NAME" \
-                --shape "VM.Standard.A1.Flex" \
-                --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-                --subnet-id "$OCI_SUBNET_OCID" \
-                --assign-public-ip true \
-                --image-id "$OCI_IMAGE_OCID" \
-                --metadata "{\"ssh_authorized_keys\":\"$OCI_SSH_PUBLIC_KEY\"}" \
-                --connection-timeout 60 \
-                --read-timeout 600 \
-                --query 'data.id' \
-                --raw-output)"
-
-              echo "INSTANCE_OCID=$INSTANCE_OCID"
-              echo "created=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            echo "No capacity. Waiting 60s..."
-            sleep 60
-          done
-
-          echo "7분 동안 자리 못 찾음. 다음 실행에서 다시 시도."
-
-      - name: Re-trigger workflow
-        if: ${{ success() && steps.retry.outputs.created != 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          sleep 60
-          gh workflow run oci-a1-retry.yml --ref main
+          try:
+              sys.exit(main())
+          except oci.exceptions.ServiceError as exc:
+              message = str(exc.message or "")
+              for key, value in os.environ.items():
+                  if key.startswith("OCI_") and value:
+                      message = message.replace(value, "[REDACTED]")
+              print(f"OCI 오류: HTTP {exc.status} / {exc.code}")
+              print(message[:1500])
+              print("이번 실행은 실패입니다. 다음 예약 실행에서 다시 시도합니다.")
+              sys.exit(1)
+          except Exception as exc:
+              print(f"설정 또는 통신 오류: {type(exc).__name__}")
+              print("Secrets와 통신 상태를 확인하세요. 다음 예약 실행은 계속됩니다.")
+              sys.exit(1)
+          PY
